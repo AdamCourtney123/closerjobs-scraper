@@ -7,7 +7,7 @@ import asyncio
 
 from config import settings
 from collectors.jobspy_collector import JobSpyCollector
-from utils.database import Database, init_db
+from utils.database import Database
 from utils.normalizer import JobNormalizer
 
 app = FastAPI(
