@@ -227,6 +227,14 @@ async def sync_jobs(
                 cur.execute("SELECT id FROM jobs WHERE fingerprint = %s", (fingerprint,))
                 existing = cur.fetchone()
 
+                # Parse posted_date safely
+                posted_at = None
+                if job.posted_date and job.posted_date not in ("None", "nan", "NaT", ""):
+                    try:
+                        posted_at = job.posted_date
+                    except:
+                        posted_at = None
+
                 if existing:
                     # Update last_seen_at
                     cur.execute(
@@ -255,15 +263,17 @@ async def sync_jobs(
                         job.url,
                         fingerprint,
                         job_type,
-                        job.posted_date if job.posted_date and job.posted_date != "None" else None,
+                        posted_at,
                         "ote" in (job.description or "").lower(),
                     ))
                     jobs_added += 1
 
+                conn.commit()  # Commit each job individually
+
             except Exception as e:
+                conn.rollback()  # Rollback failed job
                 errors.append(f"Error saving job '{job.title}': {str(e)}")
 
-        conn.commit()
         cur.close()
         conn.close()
 
