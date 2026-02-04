@@ -92,6 +92,26 @@ async def health_check():
     return {"status": "healthy", "version": "1.0.0"}
 
 
+@app.get("/db-check")
+async def db_check():
+    """Check database connection and job count"""
+    import psycopg2
+    if not DATABASE_URL:
+        return {"error": "DATABASE_URL not configured"}
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM jobs")
+        total = cur.fetchone()[0]
+        cur.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status")
+        by_status = dict(cur.fetchall())
+        cur.close()
+        conn.close()
+        return {"total_jobs": total, "by_status": by_status}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/")
 async def root():
     """Root endpoint"""
