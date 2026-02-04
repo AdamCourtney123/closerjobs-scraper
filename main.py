@@ -1,14 +1,9 @@
-from fastapi import FastAPI, HTTPException, Depends, Header, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
-import asyncio
-
-from config import settings
-from collectors.jobspy_collector import JobSpyCollector
-from utils.database import Database
-from utils.normalizer import JobNormalizer
+import os
 
 app = FastAPI(
     title="CloserJobs Scraper API",
@@ -25,200 +20,116 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize components
-db = Database(settings.database_url)
-collector = JobSpyCollector(proxy_url=settings.proxy_url)
-normalizer = JobNormalizer()
+API_KEY = os.getenv("API_KEY", "closerjobs-scraper-key-2024")
 
 
 # Auth dependency
-async def verify_api_key(x_api_key: str = Header(...)):
-    if x_api_key != settings.api_key:
+async def verify_api_key(x_api_key: str = Header(None)):
+    if x_api_key and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
     return x_api_key
 
 
-# Request/Response models
-class ScrapeRequest(BaseModel):
-    sources: List[str] = ["linkedin", "indeed", "glassdoor", "zip_recruiter"]
-    hours_old: int = 24
-    results_per_search: int = 50
+class JobResult(BaseModel):
+    title: str
+    company: Optional[str] = None
+    location: Optional[str] = None
+    description: Optional[str] = None
+    url: Optional[str] = None
+    source: str
+    posted_date: Optional[str] = None
 
 
 class ScrapeResponse(BaseModel):
     success: bool
-    run_id: str
-    jobs_found: int
-    jobs_added: int
-    jobs_updated: int
+    jobs: List[JobResult]
+    count: int
     errors: List[str]
-    duration_seconds: float
 
 
-class HealthResponse(BaseModel):
-    status: str
-    version: str
-    database_connected: bool
-
-
-# Endpoints
-@app.get("/health", response_model=HealthResponse)
+@app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    db_connected = await db.check_connection()
-    return HealthResponse(
-        status="healthy" if db_connected else "degraded",
-        version="1.0.0",
-        database_connected=db_connected,
-    )
+    return {"status": "healthy", "version": "1.0.0"}
 
 
-@app.post("/collect/jobspy", response_model=ScrapeResponse, dependencies=[Depends(verify_api_key)])
-async def collect_from_jobspy(request: ScrapeRequest, background_tasks: BackgroundTasks):
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {"message": "CloserJobs Scraper API", "docs": "/docs"}
+
+
+@app.post("/collect/jobspy", response_model=ScrapeResponse)
+async def collect_from_jobspy(
+    sources: List[str] = ["indeed", "linkedin", "glassdoor", "zip_recruiter"],
+    results_wanted: int = 25,
+    hours_old: int = 72,
+):
     """
-    Trigger job collection from major job boards via JobSpy.
-    This runs synchronously and returns results when complete.
+    Collect jobs from job boards using JobSpy.
     """
-    start_time = datetime.now()
-    errors: List[str] = []
-
-    # Create scraping run record
-    run_id = await db.create_scraping_run(source="JOBSPY")
+    errors = []
+    jobs = []
 
     try:
-        # Collect jobs from all sources
-        raw_jobs = await collector.collect_jobs(
-            sites=request.sources,
-            results_wanted=request.results_per_search,
-            hours_old=request.hours_old,
-        )
+        from jobspy import scrape_jobs
 
-        # Normalize jobs
-        normalized_jobs = []
-        for job in raw_jobs:
+        search_terms = [
+            "sales closer remote",
+            "high ticket closer",
+            "appointment setter remote",
+            "remote sales representative",
+        ]
+
+        for term in search_terms[:2]:  # Limit to 2 searches to be faster
             try:
-                normalized = normalizer.normalize(job)
-                normalized_jobs.append(normalized)
+                results = scrape_jobs(
+                    site_name=sources,
+                    search_term=term,
+                    location="remote",
+                    results_wanted=results_wanted,
+                    hours_old=hours_old,
+                    country_indeed="USA",
+                )
+
+                if results is not None and len(results) > 0:
+                    for _, row in results.iterrows():
+                        jobs.append(JobResult(
+                            title=str(row.get("title", "")),
+                            company=str(row.get("company", "")) if row.get("company") else None,
+                            location=str(row.get("location", "Remote")),
+                            description=str(row.get("description", ""))[:2000] if row.get("description") else None,
+                            url=str(row.get("job_url", "")) if row.get("job_url") else None,
+                            source=str(row.get("site", "unknown")),
+                            posted_date=str(row.get("date_posted", "")) if row.get("date_posted") else None,
+                        ))
             except Exception as e:
-                errors.append(f"Normalization error: {str(e)}")
+                errors.append(f"Error searching '{term}': {str(e)}")
 
-        # Save to database
-        jobs_added, jobs_updated = await db.upsert_jobs(normalized_jobs)
-
-        # Update scraping run
-        duration = (datetime.now() - start_time).total_seconds()
-        await db.complete_scraping_run(
-            run_id=run_id,
-            status="COMPLETED",
-            jobs_found=len(raw_jobs),
-            jobs_added=jobs_added,
-            jobs_updated=jobs_updated,
-            errors=errors,
-            duration=int(duration),
-        )
-
-        return ScrapeResponse(
-            success=True,
-            run_id=run_id,
-            jobs_found=len(raw_jobs),
-            jobs_added=jobs_added,
-            jobs_updated=jobs_updated,
-            errors=errors,
-            duration_seconds=duration,
-        )
-
+    except ImportError as e:
+        errors.append(f"JobSpy not available: {str(e)}")
     except Exception as e:
-        await db.complete_scraping_run(
-            run_id=run_id,
-            status="FAILED",
-            jobs_found=0,
-            jobs_added=0,
-            jobs_updated=0,
-            errors=[str(e)],
-            duration=int((datetime.now() - start_time).total_seconds()),
-        )
-        raise HTTPException(status_code=500, detail=str(e))
+        errors.append(f"Scraping error: {str(e)}")
 
+    # Remove duplicates by URL
+    seen_urls = set()
+    unique_jobs = []
+    for job in jobs:
+        if job.url and job.url not in seen_urls:
+            seen_urls.add(job.url)
+            unique_jobs.append(job)
+        elif not job.url:
+            unique_jobs.append(job)
 
-@app.post("/collect/jobspy/async", dependencies=[Depends(verify_api_key)])
-async def collect_from_jobspy_async(request: ScrapeRequest, background_tasks: BackgroundTasks):
-    """
-    Trigger job collection in the background.
-    Returns immediately with a run_id to check status later.
-    """
-    run_id = await db.create_scraping_run(source="JOBSPY")
-
-    async def run_collection():
-        start_time = datetime.now()
-        errors: List[str] = []
-
-        try:
-            raw_jobs = await collector.collect_jobs(
-                sites=request.sources,
-                results_wanted=request.results_per_search,
-                hours_old=request.hours_old,
-            )
-
-            normalized_jobs = []
-            for job in raw_jobs:
-                try:
-                    normalized = normalizer.normalize(job)
-                    normalized_jobs.append(normalized)
-                except Exception as e:
-                    errors.append(f"Normalization error: {str(e)}")
-
-            jobs_added, jobs_updated = await db.upsert_jobs(normalized_jobs)
-
-            await db.complete_scraping_run(
-                run_id=run_id,
-                status="COMPLETED",
-                jobs_found=len(raw_jobs),
-                jobs_added=jobs_added,
-                jobs_updated=jobs_updated,
-                errors=errors,
-                duration=int((datetime.now() - start_time).total_seconds()),
-            )
-        except Exception as e:
-            await db.complete_scraping_run(
-                run_id=run_id,
-                status="FAILED",
-                jobs_found=0,
-                jobs_added=0,
-                jobs_updated=0,
-                errors=[str(e)],
-                duration=int((datetime.now() - start_time).total_seconds()),
-            )
-
-    background_tasks.add_task(asyncio.create_task, run_collection())
-
-    return {"success": True, "run_id": run_id, "status": "RUNNING"}
-
-
-@app.get("/runs/{run_id}", dependencies=[Depends(verify_api_key)])
-async def get_scraping_run(run_id: str):
-    """Get the status of a scraping run"""
-    run = await db.get_scraping_run(run_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="Run not found")
-    return run
-
-
-@app.get("/stats", dependencies=[Depends(verify_api_key)])
-async def get_stats():
-    """Get scraping statistics"""
-    return await db.get_stats()
-
-
-@app.on_event("startup")
-async def startup():
-    await db.connect()
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    await db.disconnect()
+    return ScrapeResponse(
+        success=len(unique_jobs) > 0,
+        jobs=unique_jobs,
+        count=len(unique_jobs),
+        errors=errors,
+    )
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    port = int(os.getenv("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
